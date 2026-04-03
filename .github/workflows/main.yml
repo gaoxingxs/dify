@@ -1,0 +1,151 @@
+name: Build Dify Web Docker Image
+
+on:
+  # 手动触发，支持指定版本标签
+  workflow_dispatch:
+    inputs:
+      dify_version:
+        description: 'Dify 版本标签 (如 0.10.3, 0.9.0)'
+        required: true
+        default: '0.13.2'
+        type: string
+      next_public_base_path:
+        description: 'NEXT_PUBLIC_BASE_PATH (子路径，如 /dify)'
+        required: false
+        default: ''
+        type: string
+      next_public_api_prefix:
+        description: 'NEXT_PUBLIC_API_PREFIX (API地址)'
+        required: false
+        default: '/api'
+        type: string
+      image_tag:
+        description: '镜像标签 (默认使用 Dify 版本号)'
+        required: false
+        default: ''
+        type: string
+      platforms:
+        description: '目标平台'
+        required: false
+        default: 'linux/amd64,linux/arm64'
+        type: choice
+        options:
+          - 'linux/amd64,linux/arm64'
+          - 'linux/amd64'
+          - 'linux/arm64'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout specific tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.dify_version || github.ref_name }}
+          fetch-depth: 1
+      
+      - name: Verify tag exists
+        run: |
+          CURRENT_REF="${{ github.event.inputs.dify_version || github.ref_name }}"
+          echo "正在构建 Dify 版本: $CURRENT_REF"
+          
+          # 检查是否是有效的 tag
+          if git show-ref --tags | grep -q "refs/tags/$CURRENT_REF"; then
+            echo "✅ 找到标签: $CURRENT_REF"
+          else
+            echo "❌ 错误: 标签 $CURRENT_REF 不存在"
+            echo "可用的标签:"
+            git tag -l | head -20
+            exit 1
+          fi
+      
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Get version info
+        id: version
+        run: |
+          # 获取 Dify 版本标签
+          if [ -n "${{ github.event.inputs.dify_version }}" ]; then
+            DIFY_TAG="${{ github.event.inputs.dify_version }}"
+          else
+            DIFY_TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          
+          # 移除开头的 v 作为版本号
+          VERSION_NUMBER=$(echo "$DIFY_TAG" | sed 's/^v//')
+          
+          # 确定镜像标签
+          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+          else
+            IMAGE_TAG="$DIFY_TAG"  # 使用原始标签，如 v0.10.3
+          fi
+          
+          echo "dify_tag=$DIFY_TAG" >> $GITHUB_OUTPUT
+          echo "version_number=$VERSION_NUMBER" >> $GITHUB_OUTPUT
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          
+          echo "Dify 标签: $DIFY_TAG"
+          echo "版本号: $VERSION_NUMBER"
+          echo "镜像标签: $IMAGE_TAG"
+      
+      - name: Build and push multi-platform image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./web
+          file: ./web/Dockerfile
+          push: true
+          platforms: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/dify-web:${{ steps.version.outputs.image_tag }}
+            ghcr.io/${{ github.repository_owner }}/dify-web:${{ steps.version.outputs.version_number }}
+            ghcr.io/${{ github.repository_owner }}/dify-web:${{ steps.version.outputs.image_tag }}-${{ github.run_number }}
+          labels: |
+            org.opencontainers.image.title=Dify Web
+            org.opencontainers.image.description=Dify Web UI with custom subpath support
+            org.opencontainers.image.version=${{ steps.version.outputs.dify_tag }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          build-args: |
+            NEXT_PUBLIC_BASE_PATH=${{ github.event.inputs.next_public_base_path }}
+            NEXT_PUBLIC_API_PREFIX=${{ github.event.inputs.next_public_api_prefix }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Generate summary
+        run: |
+          cat << EOF >> $GITHUB_STEP_SUMMARY
+          ## ✅ 构建完成
+          
+          | 项目 | 值 |
+          |------|-----|
+          | Dify 版本 | ${{ steps.version.outputs.dify_tag }} |
+          | 镜像标签 | ${{ steps.version.outputs.image_tag }} |
+          | 平台支持 | ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }} |
+          | 子路径 | ${{ github.event.inputs.next_public_base_path || '未设置' }} |
+          
+          ### 📦 拉取镜像
+          \`\`\`bash
+          docker pull ghcr.io/${{ github.repository_owner }}/dify-web:${{ steps.version.outputs.image_tag }}
+          \`\`\`
+          
+          ### 🚀 运行镜像
+          \`\`\`bash
+          docker run -d -p 3000:3000 ghcr.io/${{ github.repository_owner }}/dify-web:${{ steps.version.outputs.image_tag }}
+          \`\`\`
+          EOF
